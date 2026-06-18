@@ -1,12 +1,25 @@
 {
   "name": "smartdrop-backend",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
-  "description": "SmartDrop API and indexing services (planned)",
+  "description": "SmartDrop API and indexing services",
   "engines": {
     "node": ">=20.9.0"
   },
   "scripts": {
-    "start": "node -e \"console.log('smartdrop-backend: scaffold only — implement services here.'); process.exit(0)\""
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "ioredis": "^5.4.1",
+    "node-cron": "^3.0.3",
+    "stellar-sdk": "^11.3.0",
+    "winston": "^3.14.0"
+  },
+  "devDependencies": {
+    "dotenv": "^16.4.5"
   }
 }
