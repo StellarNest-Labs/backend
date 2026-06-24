@@ -25,4 +25,8 @@ module.exports = {
     staleThresholdMinutes: parseInt(process.env.PRICE_STALE_THRESHOLD, 10) || 5,
     anomalyThresholdPercent: parseFloat(process.env.PRICE_ANOMALY_THRESHOLD, 10) || 10,
   },
+  corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:3001')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
 };

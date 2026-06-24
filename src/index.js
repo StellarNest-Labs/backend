@@ -1,15 +1,17 @@
 const express = require('express');
-const cors = require('cors');
+const helmet = require('helmet');
 const config = require('./config');
 const logger = require('./logger');
 const cache = require('./services/cache');
 const priceRefreshJob = require('./jobs/priceRefresh');
+const buildCorsMiddleware = require('./middleware/cors');
 const pricesRouter = require('./routes/prices');
 const alertsRouter = require('./routes/alerts');
 
 const app = express();
 
-app.use(cors());
+app.use(helmet());
+app.use(buildCorsMiddleware(config.corsAllowedOrigins));
 app.use(express.json());
 
 app.get('/health', (req, res) => {
@@ -20,8 +22,9 @@ app.use('/api/v1', pricesRouter);
 app.use('/api/v1', alertsRouter);
 
 app.use((err, req, res, _next) => {
-  logger.error('Unhandled error', { error: err.message, stack: err.stack });
-  res.status(500).json({ error: 'Internal server error' });
+  const status = err.status || 500;
+  if (status >= 500) logger.error('Unhandled error', { error: err.message, stack: err.stack });
+  res.status(status).json({ error: err.message || 'Internal server error' });
 });
 
 const server = app.listen(config.port, () => {
