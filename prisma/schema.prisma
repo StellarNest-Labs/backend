@@ -1,0 +1,287 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum FamilyRole {
+  OWNER
+  PARENT
+  GUARDIAN
+  CHILD
+  ADVISOR
+  VIEWER
+}
+
+enum AssetCode {
+  XLM
+  USDC
+  EURC
+  AQUA
+  CUSTOM
+}
+
+enum GoalCategory {
+  EMERGENCY_FUND
+  VACATION
+  HOUSE_PURCHASE
+  EDUCATION_FUND
+  OTHER
+}
+
+enum BillCategory {
+  ELECTRICITY
+  RENT
+  INTERNET
+  SCHOOL_FEES
+  INSURANCE
+  OTHER
+}
+
+enum BillStatus {
+  UPCOMING
+  DUE
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+enum WithdrawalStatus {
+  PENDING
+  APPROVED
+  EXECUTED
+  REJECTED
+}
+
+enum InvestmentCategory {
+  STABLE
+  GROWTH
+  YIELD
+  EXPERIMENTAL
+}
+
+enum AutomationType {
+  RECURRING_SAVINGS
+  ALLOWANCE
+  BILL_PAYMENT
+  PROFIT_DISTRIBUTION
+  INHERITANCE_RELEASE
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  passwordHash  String?
+  displayName   String
+  stellarPublicKey String? @unique
+  passkeyCredentialId String? @unique
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  memberships   FamilyMember[]
+  auditLogs     AuditLog[]
+
+  @@map("users")
+}
+
+model Family {
+  id          String   @id @default(cuid())
+  name        String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  members     FamilyMember[]
+  treasury    Treasury?
+
+  @@map("families")
+}
+
+model FamilyMember {
+  id             String     @id @default(cuid())
+  familyId       String
+  userId         String
+  role           FamilyRole
+  spendingLimit  Decimal?   @db.Decimal(20, 7)
+  joinedAt       DateTime   @default(now())
+
+  family         Family     @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([familyId, userId])
+  @@map("family_members")
+}
+
+model Treasury {
+  id                   String   @id @default(cuid())
+  familyId             String   @unique
+  contractTreasuryId   BigInt?  @unique
+  contractAddress      String?
+  name                 String
+  assetCode            AssetCode
+  assetIssuer          String?
+  balance              Decimal  @default(0) @db.Decimal(20, 7)
+  approvalThreshold    Decimal  @db.Decimal(20, 7)
+  requiredApprovals    Int      @default(1)
+  frozen               Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  family               Family   @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  savingsGoals         SavingsGoal[]
+  bills                Bill[]
+  withdrawals          WithdrawalRequest[]
+  investments          InvestmentHolding[]
+  inheritanceVault     InheritanceVault?
+  automations          Automation[]
+  auditLogs            AuditLog[]
+
+  @@map("treasuries")
+}
+
+model SavingsGoal {
+  id             String       @id @default(cuid())
+  treasuryId     String
+  contractGoalId BigInt?
+  name           String
+  category       GoalCategory @default(OTHER)
+  targetAmount   Decimal      @db.Decimal(20, 7)
+  currentAmount  Decimal      @default(0) @db.Decimal(20, 7)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  treasury       Treasury     @relation(fields: [treasuryId], references: [id], onDelete: Cascade)
+
+  @@map("savings_goals")
+}
+
+model Bill {
+  id               String       @id @default(cuid())
+  treasuryId       String
+  contractBillId   BigInt?
+  name             String
+  category         BillCategory @default(OTHER)
+  payeeName        String
+  payeeAddress     String
+  amount           Decimal      @db.Decimal(20, 7)
+  intervalDays     Int
+  nextDueAt        DateTime
+  status           BillStatus   @default(UPCOMING)
+  active           Boolean      @default(true)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  treasury         Treasury     @relation(fields: [treasuryId], references: [id], onDelete: Cascade)
+
+  @@map("bills")
+}
+
+model WithdrawalRequest {
+  id                    String           @id @default(cuid())
+  treasuryId            String
+  contractWithdrawalId  BigInt?
+  requestedByUserId     String
+  toAddress             String
+  amount                Decimal          @db.Decimal(20, 7)
+  reason                String?
+  status                WithdrawalStatus @default(PENDING)
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  treasury              Treasury         @relation(fields: [treasuryId], references: [id], onDelete: Cascade)
+  approvals             Approval[]
+
+  @@map("withdrawal_requests")
+}
+
+model Approval {
+  id            String            @id @default(cuid())
+  withdrawalId  String
+  approverId    String
+  approvedAt    DateTime          @default(now())
+
+  withdrawal    WithdrawalRequest @relation(fields: [withdrawalId], references: [id], onDelete: Cascade)
+
+  @@unique([withdrawalId, approverId])
+  @@map("approvals")
+}
+
+model InvestmentHolding {
+  id           String             @id @default(cuid())
+  treasuryId   String
+  assetCode    AssetCode
+  category     InvestmentCategory @default(GROWTH)
+  quantity     Decimal            @db.Decimal(20, 7)
+  costBasis    Decimal            @db.Decimal(20, 7)
+  currentValue Decimal            @db.Decimal(20, 7)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  treasury     Treasury           @relation(fields: [treasuryId], references: [id], onDelete: Cascade)
+
+  @@map("investment_holdings")
+}
+
+model InheritanceVault {
+  id                        String        @id @default(cuid())
+  treasuryId                String        @unique
+  timeLockAt                DateTime
+  deadManSwitchDays         Int
+  lastHeartbeatAt           DateTime      @default(now())
+  guardianApprovalsRequired Int           @default(1)
+  legalNotes                String?
+  claimed                   Boolean       @default(false)
+  claimedAt                 DateTime?
+  createdAt                 DateTime      @default(now())
+  updatedAt                 DateTime      @updatedAt
+
+  treasury                  Treasury      @relation(fields: [treasuryId], references: [id], onDelete: Cascade)
+  beneficiaries              Beneficiary[]
+
+  @@map("inheritance_vaults")
+}
+
+model Beneficiary {
+  id               String           @id @default(cuid())
+  vaultId          String
+  name             String
+  stellarAddress   String
+  allocationBps    Int
+  guardianApproved Boolean          @default(false)
+
+  vault            InheritanceVault @relation(fields: [vaultId], references: [id], onDelete: Cascade)
+
+  @@map("beneficiaries")
+}
+
+model Automation {
+  id             String         @id @default(cuid())
+  treasuryId     String
+  type           AutomationType
+  description    String
+  amount         Decimal?       @db.Decimal(20, 7)
+  intervalDays   Int?
+  nextRunAt      DateTime?
+  active         Boolean        @default(true)
+  createdAt      DateTime       @default(now())
+
+  treasury       Treasury       @relation(fields: [treasuryId], references: [id], onDelete: Cascade)
+
+  @@map("automations")
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  treasuryId  String?
+  userId      String?
+  action      String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  treasury    Treasury? @relation(fields: [treasuryId], references: [id], onDelete: SetNull)
+  user        User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@map("audit_logs")
+}
