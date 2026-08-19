@@ -1,734 +1,383 @@
-# SmartDrop backend
-
-[![CI](https://github.com/SmartDropLabs/smartdrop-backend/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SmartDropLabs/smartdrop-backend/actions/workflows/ci.yml)
-
-HTTP APIs, webhooks, and **indexing** for SmartDrop. This repository contains Node.js services that talk to **Horizon**, **Soroban RPC**, and external APIs.
-
-## Related repositories
-
-| Repository | Role |
-|------------|------|
-| [**smart-frontend**](https://github.com/SmartDropLabs/smart-frontend) | Next.js static app |
-| [**smartdrop-contracts**](https://github.com/SmartDropLabs/smartdrop-contracts) | Soroban Rust contracts |
-| [**SmartDrop**](https://github.com/SmartDropLabs/SmartDrop) | Original monorepo (reference) |
-
-## Features
-
-### Price Oracle Service
-
-Multi-source price oracle that fetches and caches USD prices for Stellar assets.
-
-**Data Sources:**
-- Stellar DEX (orderbook prices)
-- CoinGecko API
-- CoinMarketCap API
-
-**Features:**
-- Median price aggregation from multiple sources
-- Redis caching with configurable TTL (default: 60s)
-- Background job refreshes prices every 30 seconds
-- Stale price detection (>5 minutes)
-- Price anomaly logging (>20% changes)
-- Fallback chain: DEX → CoinGecko → CoinMarketCap → cached
-
-### Soroban Event Indexer
-
-Polls Soroban RPC for SmartDrop contract events and stores decoded event state in Redis so the API can answer claim-status queries without live RPC calls on every request.
-
-**Indexed events:**
-- `airdrop_created`
-- `recipient_added`
-- `token_claimed`
-- `airdrop_expired`
-
-**Features:**
-- Configurable contract ID, RPC URL, poll interval, poll limit, and start ledger
-- Last indexed ledger checkpoint persisted in Redis
-- Raw XDR and decoded event data retained for each indexed event
-- Aggregated airdrop status, recipient lists, recipient claim history, and indexer status endpoints
-- RPC errors are logged and the poller continues on the next interval
-
-## Setup
-### Webhook Delivery System
-
-Registers subscriber endpoints for SmartDrop lifecycle events and delivers signed JSON payloads with retry tracking.
-
-**Events:**
-- `airdrop.created`
-- `airdrop.executing`
-- `airdrop.completed`
-- `airdrop.failed` — fired automatically when an airdrop expires (see below), in addition to any other failure path
-- `recipient.claimed`
-
-**Features:**
-- Webhook endpoint CRUD with secrets kept out of list responses
-- Timestamped HMAC-SHA256 request signatures
-- At-least-once delivery attempts with exponential backoff
-- Delivery logs with response code, error, duration, and attempt count
-- Dead-letter storage after retry exhaustion
-
-### Airdrop Expiry Reconciliation
-
-Airdrops carry an `expiry_ledger`, validated as being in the future only at
-creation/update time. A background job (`src/jobs/airdropExpiry.js`, same
-`start()`/`stop()` pattern as the price-refresh and webhook-retry jobs)
-periodically re-checks that condition against the live network:
-
-- Every `AIRDROP_EXPIRY_CHECK_INTERVAL_SECONDS` (default 60s), fetches the
-  current Horizon ledger sequence and scans every airdrop still in a
-  non-terminal status (`draft`, `executing`).
-- Any airdrop whose `expiry_ledger` has passed is atomically transitioned to
-  `expired` and fires an `airdrop.failed` webhook event (`data.reason:
-  "expired"`) to every subscriber registered for it — no client action
-  required.
-- The transition is idempotent: re-running the check against an
-  already-expired airdrop is a guaranteed no-op, so the webhook fires
-  exactly once per airdrop even if the job runs again before anything else
-  changes its status.
-- If Horizon is temporarily unreachable, the job logs a warning and skips
-  that cycle rather than crashing — airdrops are simply re-checked on the
-  next tick.
-
-### Leader Election
-
-Background jobs (price refresh, webhook retry worker, airdrop expiry) use
-**Redis-based leader election** to ensure that across any number of horizontally-
-scaled replicas, only one instance actively runs each job at any given time.
-
-**Mechanism:**
-
-Each job type has its own Redis lock key (e.g. `leader:price_refresh`,
-`leader:webhook_retry`, `leader:airdrop_expiry`). On startup, every replica
-attempts to acquire the lock via `SET key value NX PX <ttl_ms>`. The instance
-that succeeds becomes the **leader** and runs the actual scheduled work. All
-other replicas are **followers** — they stay ready to take over, running only a
-periodic renewal check loop.
-
-The current leader periodically renews the lease using an atomic Lua script
-(`GET` + `PEXPIRE` in one round trip, keyed to only succeed if the stored value
-still matches the leader's instance ID). If the leader process dies or becomes
-unresponsive, the lease expires automatically after the TTL, and a follower
-detects the expiry on its next renewal check and acquires leadership.
-
-**Failover timing:**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `LEASE_TTL_MS` | 15000 (15s) | How long a lease is valid without renewal |
-| `LEASE_RENEW_INTERVAL_MS` | 5000 (5s) | How often the leader renews (and followers attempt to acquire) |
-
-- **Best-case failover** (leader stops gracefully): lease is released immediately
-  via the Lua-based conditional `DEL`; a follower acquires within one renewal
-  check interval (~5s).
-- **Worst-case failover** (leader crashes without cleanup): lease expires after
-  `LEASE_TTL_MS` (15s); the next follower renewal check detects it and acquires
-  (up to `LEASE_TTL_MS + LEASE_RENEW_INTERVAL_MS` ≈ 20s total).
-
-**Verifying leadership:**
-
-Check the `GET /health` endpoint. Each job entry includes a `leader` field
-(`true`/`false`) and `leader_instance_id` identifying which replica holds the
-lock. The top-level `leader_election` object shows the local instance's identity
-and lease configuration.
-
-```bash
-curl http://localhost:4000/health | jq '.jobs.price_refresh.leader'
-```
-
-To see which replica holds the lock from Redis directly:
-
-```bash
-redis-cli GET leader:price_refresh
-redis-cli GET leader:webhook_retry
-redis-cli GET leader:airdrop_expiry
-```
-
-**Graceful shutdown:**
-
-When a leader receives `SIGTERM`/`SIGINT`, the shutdown sequence releases the
-lease via the atomic conditional-DEL Lua script before closing the Redis
-connection, minimizing the failover window for followers.
-
-**Important caveat:**
-
-Leader election ensures only one instance runs the scheduled job logic, but it
-does not replace the need for atomic Redis operations within individual job ticks.
-For example, `deliveryRepository.popDueRetries` uses its own Lua-based atomic
-claim to prevent double-processing during any brief overlap during leadership
-handoffs. This is a separate concern that leader election complements but does
-not solve on its own.
-
----
-
-## 🚀 Quick Start (Docker Development)
-
-You can spin up the entire local development stack—including the API, PostgreSQL database, and Redis instance—using a single command.
-
-### Prerequisites
-* Ensure you have [Docker and Docker Compose](https://docs.docker.com/get-docker/) installed.
-
-### Spin Up the Stack
-
-1. **Clone and Navigate** to the project root directory.
-2. **Set up Environment Variables**:
-   ```bash
-   cp .env.example .env
-
-```
-
-3. **Launch the Infrastructure**:
-```bash
-docker compose up --build
-
-```
-
-
-
-The API will stand up on [http://localhost:4000](https://www.google.com/search?q=http://localhost:4000).
-
-* **Hot Reloading:** Any changes made to files within the `./src` directory will instantly trigger an application restart inside the container.
-* **Database & Cache:** Health checks prevent the API from booting until Postgres and Redis are fully operational.
-* **Teardown:** To stop the containers and maintain volume data, run `docker compose down`. To wipe database volumes completely during stop, use `docker compose down -v`.
-
----
-
-## Configuration
-
-The application reads configurations from the `.env` file at the root.
-
-**Environment Variables:**
-
-| Variable | Description | Default | Required |
-| --- | --- | --- | --- |
-| `PORT` | Server port | 4000 | No |
-| `REDIS_HOST` | Redis server host | redis | No |
-| `REDIS_PORT` | Redis server port | 6379 | No |
-| `REDIS_PASSWORD` | Redis password | undefined | No |
-| `REDIS_URL` | Redis connection string | redis://redis:6379 | No |
-| `DATABASE_URL` | PostgreSQL connection string | postgres://smartdrop:smartdrop@postgres:5432/smartdrop | No |
-| `STELLAR_HORIZON_URL` | Horizon API URL | https://horizon.stellar.org | No |
-| `SOROBAN_RPC_URL` | Soroban RPC URL for contract event polling | https://soroban-rpc.mainnet.stellar.gateway.fm | No |
-| `SMARTDROP_CONTRACT_ID` | SmartDrop contract ID to index | undefined | Yes, for indexer |
-| `INDEXER_ENABLED` | Enable Soroban event polling | true | No |
-| `INDEXER_POLL_INTERVAL_MS` | Soroban event polling interval in milliseconds | 5000 | No |
-| `INDEXER_POLL_LIMIT` | Maximum events requested per poll | 100 | No |
-| `INDEXER_START_LEDGER` | First ledger to scan when no checkpoint exists | 0 | No |
-| `USDC_ISSUER` | USDC issuer address | GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335AX2OBFLDTQLNUEHRGPTM6RIA | No |
-| `COINGECKO_API_KEY` | CoinGecko API key | undefined | No |
-| `COINMARKETCAP_API_KEY` | CoinMarketCap API key | undefined | No |
-| `PRICE_CACHE_TTL` | Cache TTL in seconds | 60 | No |
-| `PRICE_REFRESH_INTERVAL` | Refresh interval in seconds | 30 | No |
-| `PRICE_STALE_THRESHOLD` | Stale threshold in minutes | 5 | No |
-| `PRICE_ANOMALY_THRESHOLD` | Anomaly detection threshold % | 10 | No |
-| `ADMIN_API_KEY` | Bootstrap admin bearer token for API key management | undefined | Yes, for protected endpoints |
-| `LOG_LEVEL` | Logging level | info | No |
-
-| `WEBHOOK_MAX_ATTEMPTS` | Total delivery attempts (initial + retries) | 3 | No |
-| `WEBHOOK_RETRY_BASE_MS` | Base backoff between retries (ms) | 30000 | No |
-| `WEBHOOK_RETRY_FACTOR` | Exponential backoff multiplier | 2 | No |
-| `WEBHOOK_TIMEOUT_MS` | HTTP timeout per delivery attempt | 5000 | No |
-| `WEBHOOK_RETRY_POLL_MS` | Retry worker poll interval | 5000 | No |
-| `WEBHOOK_RETRY_BATCH` | Max retries processed per tick | 25 | No |
-| `WEBHOOK_RATELIMIT_WINDOW` | Mgmt rate-limit window (s) | 60 | No |
-| `WEBHOOK_RATELIMIT_MAX` | Mgmt rate-limit max requests / window / IP | 60 | No |
-| `WEBHOOK_TEST_RATELIMIT_WINDOW` | Test endpoint rate-limit window (s) | 60 | No |
-| `WEBHOOK_TEST_RATELIMIT_MAX` | Test endpoint rate-limit max / window / IP | 5 | No |
-
-| `CORS_ALLOWED_ORIGINS` | Allowed origins split by commas | http://localhost:4000,http://localhost:3001 | No |
-|----------|-------------|---------|----------|
-| `NODE_ENV` | Runtime environment: `development`, `test`, or `production` | development | No |
-| `PORT` | Server port | 3000 | No |
-| `REDIS_URL` | Redis connection URL | redis://localhost:6379 in development/test | Yes in production |
-| `DATABASE_URL` | Database connection URL reserved for persistence-backed features | postgres://localhost/smartdrop in development, postgres://localhost/smartdrop_test in test | Yes in production |
-| `STELLAR_HORIZON_URL` | Horizon API URL | https://horizon.stellar.org | No |
-| `USDC_ISSUER` | USDC issuer address | GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335AX2OBFLDTQLNUEHRGPTM6RIA | No |
-| `COINGECKO_API_KEY` | CoinGecko API key | empty | No |
-| `COINMARKETCAP_API_KEY` | CoinMarketCap API key | empty | No |
-| `PRICE_CACHE_TTL_SECONDS` | Cache TTL in seconds | 60 | No |
-| `PRICE_REFRESH_INTERVAL_SECONDS` | Refresh interval in seconds | 30 | No |
-| `PRICE_STALE_THRESHOLD_MINUTES` | Stale threshold in minutes | 5 | No |
-| `PRICE_ANOMALY_THRESHOLD_PCT` | Anomaly detection threshold % | 20 | No |
-| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | Source failures before opening a price-source circuit | 3 | No |
-| `CIRCUIT_BREAKER_SUCCESS_THRESHOLD` | Half-open successes required to close a circuit | 1 | No |
-| `CIRCUIT_BREAKER_TIMEOUT_MS` | Open-circuit cool-down before a half-open probe | 30000 | No |
-| `ADMIN_API_KEY` | Bootstrap admin bearer token for API key management | empty | Yes, for protected endpoints |
-| `AIRDROP_CSV_MAX_BYTES` | Maximum recipient CSV upload size in bytes | 5242880 (5 MiB) | No |
-| `AIRDROP_JSON_MAX_BYTES` | Maximum JSON request body size; 2 MiB accommodates 10,000 inline recipients | 2097152 (2 MiB) | No |
-| `AIRDROP_RATELIMIT_WINDOW` | Per-IP airdrop mutation rate-limit window in seconds | 60 | No |
-| `AIRDROP_RATELIMIT_MAX` | Maximum create or recipient-add requests per window and IP | 10 | No |
-| `INSTANCE_ID` | Explicit instance identity for leader election; auto-generated from hostname+UUID if empty | auto | No |
-| `LEASE_TTL_MS` | Leader lease TTL in milliseconds — how long a lease is valid without renewal | 15000 | No |
-| `LEASE_RENEW_INTERVAL_MS` | How often the leader renews its lease (and followers check to acquire) | 5000 | No |
-| `LOG_LEVEL` | Logging level: `debug`, `info`, `warn`, or `error` | info | No |
-
-
----
-
-## API Endpoints
-
-### Pagination
-
-Every list endpoint returns the same envelope shape:
-
-```json
-{
-  "data": [ /* ... */ ],
-  "pagination": {
-    "page": 1,
-    "limit": 20,
-    "total": 42,
-    "total_pages": 3,
-    "has_next": true,
-    "has_prev": false
-  }
-}
-```
-
-Request pagination with `?page=<n>&limit=<n>` (`page` defaults to 1,
-`limit` defaults to 20 and is clamped to 100). This is the canonical
-shape `src/schemas/pagination.js`'s `paginatedResponseSchema` defines,
-now applied consistently across every list endpoint (#131 — closed
-issue #35 introduced the helper but didn't get every endpoint onto it).
-
-List endpoints following this contract:
-
-- `GET /api/v1/airdrops`
-- `GET /api/v1/airdrops/:id/recipients`
-- `GET /api/v1/alerts`
-- `GET /api/v1/webhooks`
-- `GET /api/v1/airdrops/:id/onchain-recipients`
-- `GET /api/v1/recipients/:address/claims`
-
-**Intentionally exempt:** `GET /api/v1/webhooks/:id/deliveries` takes
-only `?limit=<n>` (default 50, max 100) — deliveries are naturally
-most-recent-first and capped server-side, so a `page`/offset concept
-doesn't add anything; forcing it onto the same envelope would just add
-an always-`page: 1`, always-`has_prev: false` `pagination` object with
-no real paging behavior behind it.
-
-### Get Asset Price
-
-```
-GET /api/v1/prices/:asset_code?issuer=<issuer_address>
-
-```
-
-**Response:**
-
-```json
-{
-  "asset_code": "XLM",
-  "issuer": null,
-  "price_usd": 0.1234,
-  "source": "stellar_dex",
-  "fetched_at": "2024-01-15T10:30:00.000Z",
-  "is_stale": false,
-  "stale_warning": null,
-  "sources_attempted": ["stellar_dex", "coingecko"]
-}
-
-```
-
-### Force Price Refresh
-
-```
-GET /api/v1/prices/:asset_code/refresh?issuer=<issuer_address>
-
-```
-
-Requires `Authorization: Bearer <api_key>`.
-
-### API Keys
-
-Protected endpoints use `Authorization: Bearer <api_key>`. Set `ADMIN_API_KEY` to a 32-byte hex token for bootstrap access, then create scoped API keys with the key-management endpoints.
-
-The bootstrap admin key is compared using constant-time checks over fixed-length SHA-256 digests so invalid guesses cannot short-circuit on matching prefixes or raw string length.
-
-```
-GET /api/v1/keys
-POST /api/v1/keys
-DELETE /api/v1/keys/:id
-
-```
-
-`POST /api/v1/keys` returns the raw `api_key` only once. Stored keys are hashed with SHA-256 and listed with metadata only (`label`, `created_at`, `last_used_at`, `scopes`, and `key_prefix`).
-
-### Webhook Endpoints
-
-```
-POST   /api/v1/webhooks
-GET    /api/v1/webhooks
-DELETE /api/v1/webhooks/:id
-POST   /api/v1/webhooks/:id/test
-GET    /api/v1/webhooks/:id/deliveries
-
-```
-
-### Health Check
-
-```
-GET /health
-```
-
-Returns the overall health of the service and its dependencies.
-
-**Response fields:**
-
-| Field | Description |
-|-------|-------------|
-| `status` | Overall health: `ok`, `degraded`, or `unhealthy` |
-| `timestamp` | ISO-8601 time of the response |
-| `redis.connected` | `true` when the Redis client is connected |
-| `jobs.price_refresh` | Health of the background price-refresh cron job |
-| `jobs.webhook_retry_worker` | Health of the webhook retry worker |
-| `database` | Reports `configured: true, checked: false, status: "unused"` — no active DB health probe |
-| `price_source_circuits` | Per-source circuit-breaker state (open/closed) |
-
-**Health states:**
-
-| State | Meaning |
-|-------|---------|
-| `ok` | Redis connected; all jobs running normally |
-| `degraded` | A job has not yet completed its first tick (startup grace period) |
-| `unhealthy` | Redis is disconnected, or a job has stalled past its grace period |
-
-**Job health fields** (`jobs.price_refresh` / `jobs.webhook_retry_worker`):
-
-| Field | Description |
-|-------|-------------|
-| `healthy` | `true` while the job is running within its expected interval |
-| `last_success_at` | ISO-8601 timestamp of the last successful tick, or `null` |
-| `last_error` | Error message from the last failed tick, or `null` |
-| `stalled` | `true` when no successful tick has occurred within 2× the job interval |
-
-**Example response:**
-
-```json
-{
-  "status": "ok",
-  "timestamp": "2024-01-15T10:30:00.000Z",
-  "redis": { "connected": true },
-  "jobs": {
-    "price_refresh": {
-      "healthy": true,
-      "last_success_at": "2024-01-15T10:29:55.000Z",
-      "last_error": null,
-      "stalled": false
-    },
-    "webhook_retry_worker": {
-      "healthy": true,
-      "last_success_at": "2024-01-15T10:29:58.000Z",
-      "last_error": null,
-      "stalled": false
-    }
-  },
-  "database": { "configured": true, "checked": false, "status": "unused" },
-  "price_source_circuits": [
-    { "source": "coingecko", "open": false, "openUntil": null },
-    { "source": "coinmarketcap", "open": false, "openUntil": null }
-  ]
-}
-```
-
-### Indexed Airdrop Data
-
-```
-GET /api/v1/airdrops/:id/status
-GET /api/v1/airdrops/:id/onchain-recipients
-GET /api/v1/recipients/:address/claims
-GET /api/v1/indexer/status
-```
----
-
-## Usage Examples
-
-### Fetch XLM Price
-
-```bash
-curl http://localhost:4000/api/v1/prices/XLM
-
-```
-
-### Fetch Custom Asset Price
-
-```bash
-curl "http://localhost:4000/api/v1/prices/USDC?issuer=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335AX2OBFLDTQLNUEHRGPTM6RIA"
-
-```
-
-### Force Price Refresh
-
-```bash
-curl http://localhost:4000/api/v1/prices/XLM/refresh \
-  -H "Authorization: Bearer $API_KEY"
-
-```
-
-### Create API Key
-
-```bash
-curl -X POST http://localhost:4000/api/v1/keys \
-  -H "Authorization: Bearer $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"label":"alerts worker","scopes":["alerts"]}'
-
-```
-
-### Check Service Health
-
-```bash
-curl http://localhost:4000/health
-
-```
-
-
-## Webhooks
-
-Register endpoints that receive HTTP POST callbacks when SmartDrop indexes farming/pool events.
-
-### Supported event types
-
-| Event | Description |
-|-------|-------------|
-| `pool.created` | A new farming pool was created on-chain |
-| `pool.assets_locked` | Assets were locked into a pool |
-| `pool.assets_unlocked` | Assets were unlocked from a pool |
-| `pool.rewards_distributed` | Pool distributed rewards to participants |
-| `pool.closed` | Pool was closed |
-| `price.alert` | Existing price-alert event |
-| `*` | Wildcard — subscribe to every known event |
-
-### API
-
-#### Register a webhook
-```
-POST /api/v1/webhooks
-Content-Type: application/json
-
-{
-  "url": "https://example.com/webhooks/smartdrop",
-  "events": ["pool.assets_locked", "pool.rewards_distributed"],
-  "secret": "whsec_at_least_16_chars",     // optional, generated if omitted
-  "description": "Production webhook"       // optional
-}
-```
-
-The response includes the secret in plaintext **exactly once**. Subsequent reads only return `secret_preview`.
-
-#### Manage webhooks
-```
-GET    /api/v1/webhooks               # list
-GET    /api/v1/webhooks/:id           # fetch one
-PATCH  /api/v1/webhooks/:id           # update url / events / active / description
-DELETE /api/v1/webhooks/:id           # remove
-```
-
-#### Test endpoint
-```
-POST /api/v1/webhooks/:id/test
-```
-Sends a synthetic `pool.assets_locked` payload to the registered URL and returns the resulting delivery summary. Limited to 5 calls/min/IP by default.
-
-#### Inspect deliveries (admin dashboard feed)
-```
-GET /api/v1/webhooks/:id/deliveries?limit=50
-```
-Returns the most recent delivery records: `status` (`success | pending | failed`), `attempts`, `response_status`, `last_error`, `next_retry_at`.
-
-### Outgoing request shape
-
-Every delivery is a JSON POST with the following headers:
-
-| Header | Value |
-|--------|-------|
-| `Content-Type` | `application/json` |
-| `User-Agent` | `SmartDrop-Webhooks/1.0` |
-| `X-SmartDrop-Event` | event type (e.g. `pool.assets_locked`) |
-| `X-SmartDrop-Delivery` | unique delivery id (`dlv_…`) |
-| `X-SmartDrop-Signature` | `sha256=<hex hmac of the raw body>` |
-
-Body:
-```json
-{
-  "event": "pool.assets_locked",
-  "event_id": "evt_…",
-  "occurred_at": "2026-06-25T12:00:00.000Z",
-  "data": { "...": "event-specific fields" }
-}
-```
-
-### Verifying the signature (Node.js)
-
-```js
-const crypto = require('crypto');
-
-function verifySmartDrop(req, secret) {
-  const provided = req.header('X-SmartDrop-Signature') || '';
-  const expected = 'sha256=' + crypto
-    .createHmac('sha256', secret)
-    .update(req.rawBody)        // verify against the RAW body, not re-stringified JSON
-    .digest('hex');
-  const a = Buffer.from(provided);
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-```
-
-Express tip: capture the raw body via `express.json({ verify: (req, _res, buf) => { req.rawBody = buf.toString(); } })` so the HMAC matches byte-for-byte.
-
-### Retry & failure semantics
-
-- Up to `WEBHOOK_MAX_ATTEMPTS` (default 3) total attempts per event.
-- Retries are scheduled in Redis and processed by a background worker, so retries survive process restarts.
-- Backoff is exponential with "equal jitter": `deterministic = base * factor^(attempts-1)`, then the actual delay is randomized within `[deterministic/2, deterministic)` (default deterministic values 30s → 60s → 120s, so e.g. attempt 1's actual delay lands somewhere in 15s–30s). This prevents deliveries that fail at the same attempt count around the same moment (e.g. every in-flight delivery to a subscriber whose endpoint just went down) from computing identical `nextRetryAt` values and arriving back at that endpoint in a synchronized burst.
-- **Retryable**: network errors, HTTP 5xx, 408, 429.
-- **Not retried**: HTTP 4xx (except 408/429). These are marked `failed` immediately so a misconfigured consumer cannot be retried into the ground.
-- Each delivery is logged in `webhook_deliveries` (Redis-backed today, drop-in PG migration documented in `src/repositories/deliveryRepository.js`).
-- **Safe for multiple replicas**: `webhookRetryWorker` claims due retries via `deliveryRepository.popDueRetries`, which uses a single atomic Redis Lua script (`ZRANGEBYSCORE` + `ZREM` in one round trip) rather than two separate calls. Running N instances of this backend against the same Redis is safe - each due retry is claimed by exactly one instance, so a delivery is never dispatched twice for the same retry. The worker's in-process `running` flag only guards against a single process overlapping with itself; cross-replica safety comes from the atomic claim, not from that flag.
-
-### Storage model
-
-The current implementation stores webhooks and delivery logs in Redis behind a repository abstraction. The repository files document the equivalent PostgreSQL schema verbatim — migrating to PG is a matter of swapping the repository implementation only; no caller code changes.
-
-### Rate limiting
-
-- Management endpoints under `/api/v1/webhooks`: 60 req/min/IP (configurable).
-- `/test` endpoint: 5 req/min/IP (configurable) — prevents using SmartDrop as an outbound HTTP cannon.
-- The limiter fails **open** if Redis is unreachable so a cache outage does not lock you out of management calls.
-
----
-
-
-## Error Handling
-
-The API returns appropriate HTTP status codes:
-
-* `200` - Success
-* `400` - Invalid request parameters
-* `404` - Price not available
-* `500` - Internal server error
-
-**Error Response Format:**
-
-```json
-{
-  "error": "Error type",
-  "message": "Detailed error message"
-}
-
-```
-
----
-
-## Development
-
-### Project Structure
+# <img src="assets/logo.svg" width="32" height="32" align="center" alt="" /> StellarNest — Backend
+
+The API behind **StellarNest**, a family financial coordination platform on
+Stellar. A NestJS + GraphQL service over a Postgres/Prisma data layer, with
+a thin Stellar/Soroban integration layer that builds unsigned transactions
+for the [`treasury`](https://github.com/StellarNest-Org/contracts) contract
+and hands them to the client to sign — the backend never touches a user's
+private key.
+
+This is one of three StellarNest repos:
+
+| Repo | Purpose |
+|---|---|
+| [`contracts`](https://github.com/StellarNest-Org/contracts) | The Soroban `treasury` contract |
+| [`backend`](https://github.com/StellarNest-Org/backend) *(this repo)* | GraphQL API, Postgres data layer, non-custodial Stellar integration |
+| [`frontend`](https://github.com/StellarNest-Org/frontend) | Marketing site + product preview (Next.js) |
+
+## Table of contents
+
+- [New to this stack? Start here](#new-to-this-stack-start-here)
+- [Stack](#stack)
+- [Architecture](#architecture)
+- [Why an off-chain API at all](#why-an-off-chain-api-at-all)
+- [Non-custodial Stellar flow](#non-custodial-stellar-flow)
+- [Environment variables](#environment-variables)
+- [Getting started](#getting-started)
+- [GraphQL API reference](#graphql-api-reference)
+- [REST: the Stellar signing flow](#rest-the-stellar-signing-flow)
+- [Data model](#data-model)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+
+## New to this stack? Start here
+
+A few concepts recur throughout this codebase. If any of these are new
+to you, this section should be enough to follow the rest of the README:
+
+- **NestJS** is a backend framework for Node.js/TypeScript, structured
+  around **modules** (a feature area, e.g. `families/`), **services**
+  (where the actual logic and database queries live), and either
+  **controllers** (for REST endpoints) or **resolvers** (for GraphQL).
+  If you've used Angular, the pattern — classes, decorators like
+  `@Injectable()`, and dependency injection via constructor parameters —
+  will feel familiar; it's explicitly modeled on it.
+- **GraphQL** is an alternative to a typical REST API. Instead of many
+  fixed endpoints (`GET /families/:id`, `GET /families/:id/members`,
+  ...), there's a single endpoint (`/graphql`) and the client sends a
+  **query** describing exactly which fields it wants back — so a mobile
+  app and a web dashboard can each ask for only what they need from the
+  same API, in one request instead of several. A **query** reads data; a
+  **mutation** changes it. This project's schema is **code-first**:
+  instead of writing GraphQL's schema language by hand, you write normal
+  TypeScript classes with `@ObjectType()`/`@Field()`/`@InputType()`
+  decorators (see any file under `models/` or `dto/`), and NestJS
+  generates the schema from them automatically into `src/schema.gql`.
+- **Prisma** is an ORM (object-relational mapper) — it turns the models
+  defined in `prisma/schema.prisma` into a fully-typed TypeScript client
+  (`this.prisma.family.findMany(...)`) instead of hand-written SQL, and
+  manages schema changes over time as versioned **migrations**
+  (`prisma/migrations/`).
+- **JWT (JSON Web Token)** is how a logged-in user stays logged in
+  between requests without the server keeping a session in memory: after
+  `signIn`, the client gets back a signed token, sends it as
+  `Authorization: Bearer <token>` on every future request, and
+  `JwtAuthGuard`/`JwtStrategy` verify that signature to know who's
+  calling — see `src/auth/`.
+- **Why GraphQL *and* two plain REST endpoints?** `/stellar/build` and
+  `/stellar/submit` move a raw XDR string (Stellar's binary-ish
+  transaction format, base64-encoded) — there's no meaningful "pick
+  which fields you want" for a blob of bytes, so a plain REST endpoint
+  is simpler than forcing it through GraphQL's type system. Everything
+  else — families, treasuries, savings goals, and so on — is
+  structured data that benefits from GraphQL's field-selection.
+- **"Non-custodial"** means this backend is never able to move a
+  family's funds on its own, because it never has the private key that
+  could authorize that. See [Non-custodial Stellar flow](#non-custodial-stellar-flow)
+  below for exactly how that works, and the
+  [contracts README's glossary](https://github.com/StellarNest-Org/contracts#new-to-stellarsoroban-start-here)
+  for Stellar/Soroban-specific terms like XDR, ledger, and contract id.
+
+## Stack
+
+NestJS 11 · GraphQL (code-first, Apollo Server 5 via `@nestjs/apollo`) ·
+Prisma 6 / PostgreSQL · `@stellar/stellar-sdk` 16 · JWT auth
+(`passport-jwt`, `bcryptjs`) · `@nestjs/schedule` for recurring
+bill-reminder jobs · `class-validator` / `class-transformer` for input
+validation.
+
+## Architecture
 
 ```
 src/
-├── index.js              # Express server entry point
-├── config.js             # Configuration management
-├── logger.js             # Winston logger setup
-├── routes/
-│   └── prices.js         # Price API endpoints
-├── services/
-│   ├── cache.js          # Redis cache wrapper
-│   ├── priceOracle.js    # Core oracle aggregation logic
-│   └── sources/
-│       ├── stellarDex.js    # Stellar DEX price source
-│       ├── coingecko.js     # CoinGecko API source
-│       └── coinmarketcap.js # CoinMarketCap API source
-└── jobs/
-    └── priceRefresh.js   # Background price refresh job
-
+  auth/            signup/signin, JWT issuance, Stellar address linking
+  families/        family creation, membership, role assignment
+  treasury/        treasury metadata, dashboard aggregation, freeze toggle
+  rules/           withdrawal requests/approvals, automations (rules engine)
+  savings-goals/   named savings goals with progress tracking
+  bills/           recurring bills, due/overdue reminder cron
+  investments/     investment holdings + portfolio profit/loss
+  inheritance/     inheritance vault, beneficiaries, dead-man switch
+  stellar/         non-custodial XDR builder + submitter for the treasury contract
+  prisma/          PrismaService (a thin, injectable wrapper over @prisma/client)
 ```
 
-### Adding New Price Sources
+Each feature module follows the same shape: a `*.service.ts` with the
+actual Prisma queries and authorization checks, a `*.resolver.ts`
+exposing it over GraphQL, `dto/` input types (validated with
+`class-validator`), and `models/` GraphQL output types. `families` is a
+dependency of almost every other module — most write operations check
+`FamiliesService.assertAdmin()` (Owner/Parent) or
+`FamiliesService.requireMembership()` before touching data.
 
-To add a new price source:
+Every module that touches money defers final authority to the on-chain
+`treasury` contract: this API keeps a fast, queryable **off-chain mirror**
+of on-chain state (for dashboards, notifications, and UX that shouldn't
+have to wait on a ledger round-trip) — but the actual rules (approval
+thresholds, spending limits, inheritance conditions) are enforced by the
+Soroban contract itself, not by this service.
 
-1. Create a new file in `src/services/sources/`
-2. Implement a `fetchPrice(assetCode, issuer)` function that returns a price or `null`
-3. Add the source to the `SOURCES` array in `src/services/priceOracle.js`
+## Why an off-chain API at all
 
-Example:
+If the contract is the source of truth, why have a backend? Three
+reasons:
 
-```javascript
-// src/services/sources/customSource.js
-const axios = require('axios');
-const logger = require('../../logger');
+1. **Speed.** Rendering a dashboard by simulating a dozen contract calls
+   on every page load doesn't scale. Prisma caches a queryable mirror so
+   `treasuryDashboard` is one aggregation query, not N ledger reads.
+2. **Off-chain-only data.** Bill payee names, legal notes on an
+   inheritance vault, a family's display name — none of this belongs on
+   a public ledger, but it's exactly what a family-facing UI needs.
+3. **Coordination.** Approval requests need somewhere to live *before*
+   they're on-chain (so the UI can show "1 of 2 approvals" as people
+   sign), and the `rules` module's `WithdrawalRequest`/`Approval` models
+   exist for exactly that — a staging area that mirrors, and eventually
+   gets confirmed by, the contract's own pending-withdrawal state.
 
-async function fetchPrice(assetCode, issuer) {
-  try {
-    const response = await axios.get('[https://api.example.com/price](https://api.example.com/price)', {
-      params: { asset: assetCode }
-    });
-    return response.data.price;
-  } catch (err) {
-    logger.warn('Custom source fetch failed', { assetCode, error: err.message });
-    return null;
-  }
+## Non-custodial Stellar flow
+
+`POST /stellar/build` returns **unsigned** XDR for a treasury contract
+call. The client signs it with Freighter, a hardware wallet, or a passkey
+signer, then posts the signed envelope to `POST /stellar/submit`. The
+backend never receives, stores, or has the ability to reconstruct a
+user's secret key — see `src/stellar/stellar.service.ts`, which wraps
+`@stellar/stellar-sdk`'s `rpc.Server`, `Contract`, and
+`TransactionBuilder` to simulate, prepare, and (once signed) submit
+transactions against the deployed `treasury` contract.
+
+```
+ ┌──────────┐   1. build unsigned XDR    ┌─────────┐   3. simulate + prepare   ┌──────────────┐
+ │ Frontend │ ─────────────────────────▶ │ Backend │ ────────────────────────▶│ Soroban RPC   │
+ └──────────┘                            └─────────┘                          └──────────────┘
+      │  2. sign with Freighter /                │
+      │     hardware wallet / passkey             │
+      ▼                                            │
+ ┌──────────┐   4. submit signed XDR     ┌─────────┐   5. send to network      ┌──────────────┐
+ │ Frontend │ ─────────────────────────▶ │ Backend │ ────────────────────────▶│ treasury      │
+ └──────────┘                            └─────────┘                          │ contract      │
+                                                                                └──────────────┘
+```
+
+## Environment variables
+
+See `.env.example` for the full list. The important ones:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Postgres connection string used by Prisma |
+| `JWT_SECRET` | Signs and verifies session JWTs |
+| `SOROBAN_RPC_URL` | Soroban RPC endpoint (defaults to Stellar's public testnet RPC) |
+| `STELLAR_NETWORK_PASSPHRASE` | Network passphrase used when building/submitting transactions |
+| `TREASURY_CONTRACT_ID` | The deployed `treasury` contract's id — see [`contracts`](https://github.com/StellarNest-Org/contracts) |
+| `STELLAR_READ_SOURCE_ACCOUNT` | A funded account used as the simulation source for read-only contract calls |
+| `CORS_ORIGIN` | Comma-separated list of allowed origins (defaults to the frontend's dev URL) |
+| `PORT` | HTTP port (default `4000`) |
+
+## Getting started
+
+```bash
+cp .env.example .env
+docker compose up -d          # starts Postgres 16 on localhost:5432
+npm install
+npx prisma generate           # generates the Prisma client from schema.prisma
+npx prisma migrate deploy     # applies prisma/migrations
+npm run start:dev             # http://localhost:4000/graphql
+```
+
+`npm run start:dev` runs Nest in watch mode. The GraphQL schema is
+generated **code-first** — written as TypeScript decorators in each
+module's resolver/model files, not hand-authored SDL — and printed to
+`src/schema.gql` on boot (gitignored; regenerated every start). Open
+`http://localhost:4000/graphql` for the interactive Apollo sandbox once
+the server is running.
+
+```bash
+npm test          # unit tests (Jest, Prisma mocked — no DB required)
+npm run lint       # ESLint (flat config)
+npm run build      # tsc build to dist/
+```
+
+## GraphQL API reference
+
+All resolvers except `signUp`/`signIn` require a `Bearer` JWT
+(`Authorization: Bearer <token>`), enforced by `JwtAuthGuard`. Below is
+every query and mutation exposed today, grouped by module.
+
+**Auth** (`src/auth`)
+```graphql
+mutation { signUp(input: { email: "amara@family.com", password: "••••••••", displayName: "Amara" }) { accessToken } }
+mutation { signIn(input: { email: "amara@family.com", password: "••••••••" }) { accessToken } }
+```
+
+**Families** (`src/families`)
+```graphql
+query   { myFamilies { id name members { displayName role } } }
+query   { family(id: "fam_1") { id name members { userId role spendingLimit } } }
+mutation{ createFamily(input: { name: "Adeyemi Family" }) { id } }
+mutation{ addFamilyMember(input: { familyId: "fam_1", email: "chidi@family.com", displayName: "Chidi", role: PARENT }) { members { displayName role } } }
+mutation{ updateFamilyMemberRole(input: { memberId: "mem_1", role: GUARDIAN }) { id } }
+```
+
+**Treasury** (`src/treasury`)
+```graphql
+query   { treasuryByFamily(familyId: "fam_1") { id contractAddress balance: approvalThreshold } }
+query   { treasuryDashboard(treasuryId: "trs_1") { totalBalance totalSavings billsDueThisMonth investmentsValue monthlySpending upcomingTransfers inheritanceStatus pendingApprovals } }
+mutation{ createTreasury(input: { familyId: "fam_1", name: "Adeyemi Family Treasury", assetCode: USDC, approvalThreshold: 1000, requiredApprovals: 2 }) { id } }
+mutation{ recordOnChainTreasury(input: { treasuryId: "trs_1", contractTreasuryId: "1", contractAddress: "C..." }) { id } }
+mutation{ setTreasuryFrozen(treasuryId: "trs_1", frozen: true) { frozen } }
+```
+
+**Rules** (`src/rules`) — withdrawal approvals and automations
+```graphql
+query   { withdrawalRequests(treasuryId: "trs_1") { id amount status approvalCount } }
+mutation{ requestWithdrawal(input: { treasuryId: "trs_1", toAddress: "G...", amount: 500, reason: "Rent" }) { id status } }
+mutation{ approveWithdrawal(withdrawalId: "wd_1") { status approvalCount } }
+mutation{ setApprovalRule(input: { treasuryId: "trs_1", approvalThreshold: 1000, requiredApprovals: 2 }) }
+query   { automations(treasuryId: "trs_1") { id type description nextRunAt active } }
+mutation{ createAutomation(input: { treasuryId: "trs_1", type: RECURRING_SAVINGS, description: "Save $200 every payday", amount: 200, intervalDays: 14 }) { id } }
+mutation{ toggleAutomation(automationId: "auto_1", active: false) { active } }
+```
+
+**Savings goals** (`src/savings-goals`)
+```graphql
+query   { savingsGoals(treasuryId: "trs_1") { id name targetAmount currentAmount progress } }
+mutation{ createSavingsGoal(input: { treasuryId: "trs_1", name: "Emergency Fund", category: EMERGENCY_FUND, targetAmount: 5000 }) { id } }
+mutation{ contributeToGoal(input: { goalId: "goal_1", amount: 250 }) { currentAmount progress } }
+```
+
+**Bills** (`src/bills`)
+```graphql
+query   { bills(treasuryId: "trs_1") { id name category amount nextDueAt status } }
+mutation{ createBill(input: { treasuryId: "trs_1", name: "Rent", category: RENT, payeeName: "Landlord", payeeAddress: "G...", amount: 2200, intervalDays: 30 }) { id } }
+mutation{ cancelBill(billId: "bill_1") { active status } }
+```
+
+**Investments** (`src/investments`)
+```graphql
+query   { portfolio(treasuryId: "trs_1") { totalValue totalProfitLoss totalProfitLossPercent holdings { assetCode category currentValue profitLoss } } }
+mutation{ addInvestmentHolding(input: { treasuryId: "trs_1", assetCode: XLM, category: GROWTH, quantity: 10000, costBasis: 4200, currentValue: 5100 }) { id profitLoss } }
+```
+
+**Inheritance** (`src/inheritance`)
+```graphql
+query   { inheritanceVault(treasuryId: "trs_1") { timeLockAt deadManSwitchDays claimed beneficiaries { name allocationBps guardianApproved } } }
+mutation{ createInheritanceVault(input: { treasuryId: "trs_1", timeLockAt: "2040-01-01T00:00:00Z", deadManSwitchDays: 365, guardianApprovalsRequired: 1, beneficiaries: [{ name: "Zainab", stellarAddress: "G...", allocationBps: 5000 }, { name: "Kene", stellarAddress: "G...", allocationBps: 5000 }] }) { id } }
+mutation{ sendInheritanceHeartbeat(treasuryId: "trs_1") { lastHeartbeatAt } }
+mutation{ approveInheritanceClaim(treasuryId: "trs_1", beneficiaryId: "ben_1") { beneficiaries { guardianApproved } } }
+```
+
+## REST: the Stellar signing flow
+
+Two endpoints, both behind `JwtAuthGuard`, live outside GraphQL because
+they move raw XDR strings rather than typed objects:
+
+```http
+POST /stellar/build
+Content-Type: application/json
+
+{
+  "sourcePublicKey": "GABC...",
+  "method": "request_withdrawal",
+  "args": ["1", "GDEST...", "50000000"]
 }
-
-module.exports = { fetchPrice };
-
+→ { "xdr": "AAAAAg..." }
 ```
 
----
+```http
+POST /stellar/submit
+Content-Type: application/json
+
+{ "signedXdr": "AAAAAg..." }
+→ { "hash": "abcd1234...", "status": "SUCCESS" }
+```
+
+`method` must be one of the contract calls `StellarService` knows how to
+encode arguments for: `create_treasury`, `deposit`,
+`request_withdrawal`, `approve_withdrawal`, `contribute_to_goal`,
+`heartbeat`, `claim_inheritance` (see
+`src/stellar/dto/build-invocation.dto.ts`).
+
+## Data model
+
+See `prisma/schema.prisma` for the full model. Money fields are
+`Decimal(20, 7)` to avoid floating-point drift (matching Stellar's 7
+decimal places of precision); roles (`FamilyRole`) and asset codes
+(`AssetCode`: `XLM`, `USDC`, `EURC`, `AQUA`, `CUSTOM`) are Postgres enums
+shared between the GraphQL schema and the database via `@prisma/client`.
+
+```
+User ──< FamilyMember >── Family ── Treasury ──< SavingsGoal
+                                        │      ├─< Bill
+                                        │      ├─< WithdrawalRequest >── Approval
+                                        │      ├─< InvestmentHolding
+                                        │      ├─< Automation
+                                        │      ├─< AuditLog
+                                        │      └── InheritanceVault ──< Beneficiary
+```
+
+`Treasury.contractTreasuryId` / `contractAddress` link an off-chain row
+to its on-chain counterpart once `recordOnChainTreasury` confirms
+deployment; both are nullable because a treasury can exist off-chain
+briefly before its on-chain creation transaction confirms.
+
+## Testing
+
+26 Jest unit tests across five spec files, all with `PrismaService` and
+`FamiliesService` mocked (no database needed to run them):
+
+- `auth.service.spec.ts` — sign-up conflict handling, password hashing,
+  sign-in success/failure
+- `families.service.spec.ts` — `assertAdmin` allows Owner/Parent, rejects
+  every other role and non-members
+- `rules.service.spec.ts` — auto-execute below threshold vs. pending
+  above it, frozen-treasury blocking, child spending-limit enforcement,
+  viewer rejection, approval-count-triggers-execution, duplicate-approval
+  rejection
+- `savings-goals.service.spec.ts` — admin-only goal creation, contribution
+  increments
+- `inheritance.service.spec.ts` — allocation-sum validation, owner-only
+  vault creation, `isClaimable` under time-lock / dead-man-switch /
+  neither
+
+```bash
+npm test
+npm run test:cov   # with coverage
+```
+
+## Deployment
+
+```bash
+docker build -t stellarnest-backend .
+docker run -p 4000:4000 --env-file .env stellarnest-backend
+```
+
+The `Dockerfile` is a two-stage build: `npm ci` + `prisma generate` +
+`npm run build` in the build stage, then a slim runtime image with only
+production dependencies and the compiled `dist/`. Run
+`npx prisma migrate deploy` against your production `DATABASE_URL`
+before starting the container for the first time. `.github/workflows/ci.yml`
+runs lint, unit tests, and a build against a throwaway Postgres service
+container on every push/PR.
 
 ## Troubleshooting
 
-### Redis Connection Issues
+- **`PrismaClientInitializationError: Can't reach database server`** —
+  Postgres isn't running or `DATABASE_URL` is wrong; `docker compose up -d`
+  and check the port matches `.env`.
+- **GraphQL schema didn't update after editing a resolver** — restart
+  `start:dev`; `src/schema.gql` is regenerated on boot, not hot-reloaded
+  mid-request.
+- **`/stellar/build` fails with a simulation error** — usually means
+  `TREASURY_CONTRACT_ID` isn't set to a real deployed contract, or
+  `STELLAR_READ_SOURCE_ACCOUNT` isn't funded on the target network.
 
-If you see "Redis connection error" in logs:
+## Contributing
 
-* Verify containers are running: `docker compose ps`
-* Check Redis logs: `docker compose logs redis`
-* Ensure environmental parameters (`REDIS_HOST=redis`) reference the compose network alias rather than `localhost`.
-- Verify Redis is running: `redis-cli ping`
-- Check `REDIS_URL` in `.env`
-- If Redis requires a password, include it in the connection URL
-
-### Price Not Available
-
-If prices return `null`:
-
-* Check that at least one price source is configured
-* Verify API keys for CoinGecko/CoinMarketCap if using those sources
-* Check logs for specific source errors
-* Stellar DEX may have no liquidity for the asset
-
-### Rate Limiting
-
-External APIs may rate limit requests:
-
-* CoinGecko: Free tier has rate limits
-* CoinMarketCap: Requires API key for production use
-* The service handles rate limits gracefully and falls back to other sources
-
----
-
-## Monitoring
-
-The service logs important events:
-
-* Price fetches from each source
-* Price anomalies (>10% changes)
-* Stale price warnings
-* Cache refresh cycles
-* API errors
-- Price fetches from each source
-- Price anomalies (>20% changes)
-- Stale price warnings
-- Cache refresh cycles
-- API errors
-
-Monitor logs for:
-
-* Frequent source failures
-* Price anomalies (may indicate market volatility or data issues)
-* Stale prices (may indicate cache or source issues)
-
-## License
-
-MIT
+Issues and PRs are welcome. Before opening a PR: `npm run lint`,
+`npm test`, and `npm run build` should all pass. See
+[`StellarNest-Org/contracts`](https://github.com/StellarNest-Org/contracts)
+for the on-chain rules this API defers to, and
+[`StellarNest-Org/frontend`](https://github.com/StellarNest-Org/frontend)
+for the client that consumes this API.
