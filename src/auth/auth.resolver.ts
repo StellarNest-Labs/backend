@@ -1,3 +1,4 @@
+// Auth resolver.
 import { Args, Mutation, Resolver } from '@nestjs/graphql';
 import { AuthService } from './auth.service';
 import { AuthPayload, SignInInput, SignUpInput } from './dto/auth.dto';

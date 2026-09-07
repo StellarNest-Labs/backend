@@ -1,3 +1,4 @@
+// Treasury dto.
 import { Field, Float, InputType, Int } from '@nestjs/graphql';
 import { AssetCode } from '@prisma/client';
 import { IsEnum, IsPositive, Min } from 'class-validator';

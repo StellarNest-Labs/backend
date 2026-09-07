@@ -1,3 +1,4 @@
+<!-- Readme. -->
 # <img src="assets/logo.svg" width="32" height="32" align="center" alt="" /> StellarNest — Backend
 
 The API behind **StellarNest**, a family financial coordination platform on

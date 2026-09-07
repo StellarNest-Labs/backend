@@ -1,3 +1,4 @@
+// Savings goals service spec tests.
 import { GoalCategory } from '@prisma/client';
 import { SavingsGoalsService } from './savings-goals.service';
 import { PrismaService } from '../prisma/prisma.service';

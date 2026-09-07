@@ -1,3 +1,4 @@
+// Family dto.
 import { Field, Float, InputType } from '@nestjs/graphql';
 import { FamilyRole } from '@prisma/client';
 import { IsEmail, IsEnum, IsOptional, IsPositive } from 'class-validator';

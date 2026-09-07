@@ -1,3 +1,4 @@
+// Investment dto.
 import { Field, Float, InputType } from '@nestjs/graphql';
 import { AssetCode, InvestmentCategory } from '@prisma/client';
 import { IsEnum, IsPositive } from 'class-validator';

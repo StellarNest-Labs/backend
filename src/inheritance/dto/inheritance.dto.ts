@@ -1,3 +1,4 @@
+// Inheritance dto.
 import { Field, InputType, Int } from '@nestjs/graphql';
 import { Type } from 'class-transformer';
 import { ArrayMinSize, IsInt, IsOptional, Min, ValidateNested } from 'class-validator';

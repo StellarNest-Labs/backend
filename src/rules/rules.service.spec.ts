@@ -1,3 +1,4 @@
+// Rules service spec tests.
 import { BadRequestException, ConflictException } from '@nestjs/common';
 import { WithdrawalStatus } from '@prisma/client';
 import { RulesService } from './rules.service';
