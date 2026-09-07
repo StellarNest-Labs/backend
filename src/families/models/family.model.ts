@@ -1,3 +1,4 @@
+// Family model.
 import { Field, ID, ObjectType, registerEnumType } from '@nestjs/graphql';
 import { FamilyRole } from '@prisma/client';
 
