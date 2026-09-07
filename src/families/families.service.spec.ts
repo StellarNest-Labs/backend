@@ -1,3 +1,4 @@
+// Families service spec tests.
 import { ForbiddenException } from '@nestjs/common';
 import { FamilyRole } from '@prisma/client';
 import { FamiliesService } from './families.service';

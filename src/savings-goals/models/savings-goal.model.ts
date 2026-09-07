@@ -1,3 +1,4 @@
+// Savings goal model.
 import { Field, Float, ID, ObjectType, registerEnumType } from '@nestjs/graphql';
 import { GoalCategory } from '@prisma/client';
 

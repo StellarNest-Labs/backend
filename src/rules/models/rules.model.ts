@@ -1,3 +1,4 @@
+// Rules model.
 import { Field, Float, ID, Int, ObjectType, registerEnumType } from '@nestjs/graphql';
 import { AutomationType, WithdrawalStatus } from '@prisma/client';
 

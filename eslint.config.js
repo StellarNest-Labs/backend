@@ -1,3 +1,4 @@
+// Eslint config configuration.
 const tseslint = require('@typescript-eslint/eslint-plugin');
 const tsParser = require('@typescript-eslint/parser');
 

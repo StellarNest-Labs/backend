@@ -1,3 +1,4 @@
+// Stellar controller.
 import { BadRequestException, Body, Controller, Post, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { StellarService } from './stellar.service';

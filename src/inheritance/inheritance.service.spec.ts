@@ -1,3 +1,4 @@
+// Inheritance service spec tests.
 import { BadRequestException } from '@nestjs/common';
 import { InheritanceService } from './inheritance.service';
 import { PrismaService } from '../prisma/prisma.service';

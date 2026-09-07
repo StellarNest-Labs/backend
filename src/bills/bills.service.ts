@@ -1,3 +1,4 @@
+// Bills service.
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { BillCategory, BillStatus } from '@prisma/client';

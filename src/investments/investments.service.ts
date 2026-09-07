@@ -1,3 +1,4 @@
+// Investments service.
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { AssetCode, InvestmentCategory } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
