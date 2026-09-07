@@ -1,3 +1,4 @@
+// Families module.
 import { Module } from '@nestjs/common';
 import { FamiliesService } from './families.service';
 import { FamiliesResolver } from './families.resolver';

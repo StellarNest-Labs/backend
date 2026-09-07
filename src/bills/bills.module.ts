@@ -1,3 +1,4 @@
+// Bills module.
 import { Module } from '@nestjs/common';
 import { FamiliesModule } from '../families/families.module';
 import { BillsService } from './bills.service';

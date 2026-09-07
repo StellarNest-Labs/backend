@@ -1,3 +1,4 @@
+// Inheritance module.
 import { Module } from '@nestjs/common';
 import { FamiliesModule } from '../families/families.module';
 import { InheritanceService } from './inheritance.service';

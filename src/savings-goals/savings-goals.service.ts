@@ -1,3 +1,4 @@
+// Savings goals service.
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { GoalCategory } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';

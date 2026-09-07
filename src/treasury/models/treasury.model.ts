@@ -1,3 +1,4 @@
+// Treasury model.
 import { Field, Float, ID, Int, ObjectType, registerEnumType } from '@nestjs/graphql';
 import { AssetCode } from '@prisma/client';
 
