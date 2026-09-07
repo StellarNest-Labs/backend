@@ -1,3 +1,4 @@
+// Treasury module.
 import { Module } from '@nestjs/common';
 import { FamiliesModule } from '../families/families.module';
 import { TreasuryService } from './treasury.service';

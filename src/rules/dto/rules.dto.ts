@@ -1,3 +1,4 @@
+// Rules dto.
 import { Field, Float, InputType, Int } from '@nestjs/graphql';
 import { AutomationType } from '@prisma/client';
 import { IsEnum, IsOptional, IsPositive, Min } from 'class-validator';

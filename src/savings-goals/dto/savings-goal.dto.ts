@@ -1,3 +1,4 @@
+// Savings goal dto.
 import { Field, Float, InputType } from '@nestjs/graphql';
 import { GoalCategory } from '@prisma/client';
 import { IsEnum, IsPositive } from 'class-validator';
