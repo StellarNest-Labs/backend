@@ -1,3 +1,4 @@
+// Bill dto.
 import { Field, Float, InputType, Int } from '@nestjs/graphql';
 import { BillCategory } from '@prisma/client';
 import { IsEnum, IsPositive, Min } from 'class-validator';

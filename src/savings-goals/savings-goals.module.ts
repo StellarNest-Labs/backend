@@ -1,3 +1,4 @@
+// Savings goals module.
 import { Module } from '@nestjs/common';
 import { FamiliesModule } from '../families/families.module';
 import { SavingsGoalsService } from './savings-goals.service';

@@ -1,3 +1,4 @@
+// Inheritance service.
 import {
   BadRequestException,
   ConflictException,

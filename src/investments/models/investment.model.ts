@@ -1,3 +1,4 @@
+// Investment model.
 import { Field, Float, ID, ObjectType, registerEnumType } from '@nestjs/graphql';
 import { AssetCode, InvestmentCategory } from '@prisma/client';
 
